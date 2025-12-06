@@ -56,19 +56,6 @@
       svgEl.setAttribute("height", rect.height);
     })
 
-    async function fillFirstRow() {
-        const values = [1, 2, 3, 4, 5, 6];
-
-        for (let c = 0; c < values.length; c++) {
-        table[0][c] = values[c];
-        
-        // allow DOM to update
-        await tick();
-
-        // delay for animation pacing
-        await new Promise(res => setTimeout(res, 200));
-        }
-    }
 
     // implement the hirschberg algorithm later to properly generate the frames
     function generateFrames() {
@@ -667,15 +654,6 @@
       return highlights[r][c]; // fall back to actual animation highlight
     }
 
-    function getCellElement(r, c) {
-      return cellRefs[r]?.[c] ?? null;
-    }
-
-    function animateSummingCell(r, c) {
-      const cell = getCellElement(r, c);
-      cell.classList.add("summing");
-      setTimeout(() => cell.classList.remove("summing"), 100);
-    }
 
 
 </script>
@@ -814,14 +792,14 @@
 <div class="main-container">
 
 <div class="input-block">
-  <label>DNA Sequence A</label>
-  <textarea bind:value={seqA} placeholder="ACGTACGT" spellcheck="false" autocomplete="off"></textarea>
+  <label for="seqA">DNA Sequence A</label>
+  <textarea id="seqA" bind:value={seqA} placeholder="ACGTACGT" spellcheck="false" autocomplete="off"></textarea>
 </div>
 
 <div class="input-block">
 
-  <label>DNA Sequence B</label>
-  <textarea bind:value={seqB} placeholder="AGTACG" spellcheck="false" autocomplete="off"></textarea>    
+  <label for="seqB">DNA Sequence B</label>
+  <textarea id="seqB" bind:value={seqB} placeholder="AGTACG" spellcheck="false" autocomplete="off"></textarea>    
 </div>
 
 <div class="top-buttons">
