@@ -1,721 +1,298 @@
 <script>
-    import { fade } from 'svelte/transition';
-    import { tick } from 'svelte';
-    import { csvParse, format, sum } from 'd3';
-    import { onMount } from "svelte";
-    import Article from "./Article.svelte";
+  import { onDestroy, tick } from "svelte";
+  import Article from "./Article.svelte";
+  import { applyFrame, createBoard, generateFrames, pathCells } from "./lib/hirschberg.js";
 
-    const matchScore = 0;
-    const mismatchScore = 1;
-    // Input sequences (you can pass these in later)
-    export let seqA = "AGTACGCA";
-    export let seqB = "TATGC";    
+  export let seqA = "AGTACGCA";
+  export let seqB = "TATGC";
 
-    const yellow = "cfb700";
+  // ---------------------------------------------------------------------------
+  // Input checks
+  // ---------------------------------------------------------------------------
 
-    $: seqA = seqA.toUpperCase();
-    $: seqB = seqB.toUpperCase();
+  // Longer sequences make the table too wide for the page and the animation
+  // run for minutes.
+  const MAX_LEN = 20;
 
-    // Number of rows/cols for DP table
-    $: rows = seqA.length + 1;
-    $: cols = seqB.length + 1;
+  // Nucleotides only (U so RNA works too). Anything else is dropped.
+  const cleanSeq = (seq) => seq.toUpperCase().replace(/[^ACGTU]/g, "").slice(0, MAX_LEN);
 
-    let local_nrows = 0;
-    let local_ncols = 0;
-    let local_rowOffset = 0;
-    let local_colOffset = 0;
+  $: seqA = cleanSeq(seqA);
+  $: seqB = cleanSeq(seqB);
 
-    let frames = [];
-    let currentFrame = 0;
-    let playing = false;
-    let speed = 150;
-    let lastDisplayedRow = -1;
+  // Tells the user why a keystroke didn't show up. This reads the raw input,
+  // before cleanSeq strips it.
+  let inputNotice = "";
+  let noticeTimer;
+  function explainRejectedInput(event) {
+    const raw = event.target.value.toUpperCase();
+    if (/[^ACGTU]/.test(raw)) inputNotice = "Only A, C, G, T and U are allowed.";
+    else if (raw.length > MAX_LEN) inputNotice = `Sequences are capped at ${MAX_LEN} bases.`;
+    else return;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => (inputNotice = ""), 2500);
+  }
 
-    // Initialize empty DP table
-    $: table = Array.from({ length: rows }, () =>
-        Array.from({ length: cols }, () => "")
-    );
+  // The box grows with the sequence but is never narrower than the placeholder.
+  const boxWidthInChars = (seq) => Math.max(seq.length, 8) + 1;
 
-    $: highlights = Array.from({ length: rows }, () =>
-        Array.from({ length: cols }, () => "")
-    );
+  // ---------------------------------------------------------------------------
+  // The board
+  // ---------------------------------------------------------------------------
 
-     $: sumPulse = Array.from({ length: rows }, () =>
-        Array(cols).fill(false)
-    );
+  // One extra row and column for the empty prefix.
+  $: rows = seqA.length + 1;
+  $: cols = seqB.length + 1;
 
-    let tableEl;
-    let svgEl;
-    let tableRect = { left: 0, top: 0, width: 0, height: 0 };
+  // Recreated whenever the sequences change size, so the grid can never be
+  // indexed against old dimensions.
+  $: board = createBoard(rows, cols);
+  $: pulsing = Array.from({ length: rows }, () => Array(cols).fill(false));
 
-    onMount(() => {
-      const rect = tableEl.getBoundingClientRect();
-      console.log("rect:", rect);
+  function resetBoard({ withCorners }) {
+    board = createBoard(rows, cols);
+    pulsing = Array.from({ length: rows }, () => Array(cols).fill(false));
+    // The two corners are always on the alignment path.
+    if (withCorners) {
+      board.highlights[0][0] = true;
+      board.highlights[rows - 1][cols - 1] = true;
+    }
+    pathPoints = "";
+  }
 
-      svgEl.setAttribute("width", rect.width);
-      svgEl.setAttribute("height", rect.height);
-    })
+  // Replays pass animate = false. Pulsing every cell along the way would also
+  // restart the gold animation on cells already on the path.
+  function showFrame(index, animate = true) {
+    const frame = frames[index];
+    applyFrame(board, frame);
+    if (animate && frame.type === "sumCell") pulse(frame.r, frame.c);
+    board = board;
+  }
 
+  function pulse(r, c) {
+    pulsing[r][c] = true;
+    // 200ms matches the CSS animation. The grid may have shrunk by then if an
+    // input was edited, so check the row still exists.
+    setTimeout(() => {
+      if (pulsing[r]) pulsing[r][c] = false;
+    }, 200);
+  }
 
-    // implement the hirschberg algorithm later to properly generate the frames
-    function generateFrames() {
-      frames = []
-      currentFrame = 0;
-      clearTable();
-      highlights = highlights.map(row => row.map(() => ""));
-      highlights[0][0] = yellow;
-      highlights[rows-1][cols-1] = yellow;
-      //const values = [1, 2, 3, 4, 5, 6];
- 
-      hirschberg(seqA, seqB, 0, 0);
-      frames = dedupeHighlights(frames);
-      if(frames.length !==0) togglePlay();
-      console.log(frames);
+  // ---------------------------------------------------------------------------
+  // Playback
+  // ---------------------------------------------------------------------------
+
+  const FRAME_MS = 150;
+  // Linger on each new path cell. updateBounds draws nothing, so don't wait on it.
+  const extraDelay = { highlight: 250, updateBounds: -FRAME_MS };
+
+  let frames = [];
+  let currentFrame = 0;
+  let playing = false;
+
+  // The sequences the current frames were built from. Editing an input
+  // invalidates the frames, since they hold coordinates into the old table.
+  let framesFor = null;
+  $: if (framesFor && (framesFor.a !== seqA || framesFor.b !== seqB)) clearAll();
+
+  const atEnd = () => frames.length > 0 && currentFrame >= frames.length;
+
+  function align() {
+    playing = false;
+    currentFrame = 0;
+    resetBoard({ withCorners: true });
+    frames = generateFrames(seqA, seqB);
+    framesFor = { a: seqA, b: seqB };
+    if (frames.length > 0) togglePlay();
+  }
+
+  function clearAll() {
+    playing = false;
+    frames = [];
+    framesFor = null;
+    currentFrame = 0;
+    resetBoard({ withCorners: false });
+  }
+
+  function togglePlay() {
+    if (playing) playing = false;
+    else if (frames.length > 0) play();
+  }
+
+  // Each call to play() takes a new run number. A loop that was asleep when
+  // playback was paused and restarted sees a newer run and quits, instead of
+  // seeing `playing` is true again and running alongside the new loop.
+  let playRun = 0;
+
+  // A loop still asleep when the page goes away would wake up and draw into
+  // elements that no longer exist.
+  onDestroy(() => playRun++);
+
+  async function play() {
+    const run = ++playRun;
+    playing = true;
+
+    while (playing && run === playRun && currentFrame < frames.length) {
+      const frame = frames[currentFrame];
+      showFrame(currentFrame++);
+      await tick();
+      await new Promise((resolve) => setTimeout(resolve, FRAME_MS + (extraDelay[frame.type] ?? 0)));
     }
 
-    function applyFrame(i) {
-      //TODO: generatee cases based on type variable of frame
-      const f = frames[i]
-      let clear_row_index = -1;
-      let rbound = local_rowOffset + local_nrows;
-      let cbound = local_colOffset + local_ncols;
-
-      switch (f.type){
-        case "setCell":
-          table[f.r][f.c] = f.value;
-          clear_row_index = -1;
-
-          
-
-
-          // Detect start of a new row (topdown pass case)
-          if (f.r !== lastDisplayedRow){
-            lastDisplayedRow = f.r;
-            //console.log(lastDisplayedRow + " | " + Math.floor(rows/2) + " | " + f.c);
-            if((lastDisplayedRow - local_rowOffset) < local_nrows/2) { // topdown case
-              clear_row_index = lastDisplayedRow - 2;
-            } else { // bottomup case
-              clear_row_index = lastDisplayedRow + 2;
-            }
-            
-          }
-
-          // end of topdown pass
-          if ((f.r === (local_rowOffset + Math.floor(local_nrows/2))) && (f.c === (local_colOffset + local_ncols-1))){
-            clear_row_index = f.r-1;
-          }
-
-          // end of bottomup pass (redundant now that sumcell exists maybe?)
-          if (f.r === (local_rowOffset + Math.floor(local_nrows/2) + 1) && f.c === local_colOffset){
-            clear_row_index = f.r+1;
-          }
-
-          // clear the row
-          if (clear_row_index >= 0 && clear_row_index < rbound){
-            for (let c = local_colOffset ; c < cbound; c++){
-              table[clear_row_index][c] = "";
-            }
-          }
-          
-          break;
-        
-        // occurs on last row of the bottom up pass
-        case "sumCell":
-          table[f.r][f.c] += f.value;
-          clear_row_index = -1;
-
-          if (f.r === (local_rowOffset + Math.floor(local_nrows/2)) && f.c === local_colOffset){
-            clear_row_index = f.r+1;
-          }
-
-          // clear the row
-          if (clear_row_index >= 0 && clear_row_index < rbound){
-            for (let c = local_colOffset ; c < cbound; c++){
-              table[clear_row_index][c] = "";
-            }
-          }
-
-          sumPulse[f.r][f.c] = true;
-          setTimeout(() => sumPulse[f.r][f.c] = false, 200); // match animation length
-
-          break;
-
-        case "updateBounds":
-          local_nrows = f.r;
-          local_ncols = f.c;
-          local_rowOffset = f.rowOffset;
-          local_colOffset = f.colOffset;
-          console.log("updating localbounds", local_nrows, local_ncols, local_rowOffset, local_colOffset);
-          break;
-
-        // todo: refactor this to highlight
-        case "highlight":
-          highlights[f.r][f.c] = "cfb700";
-          break;
-
-        case "drawSVG":
-          generateAlignmentSVG(35);
-          break;
-        
-        case "clearTable":
-          clearTable();
-          break;
-
-      }
-    }
-
-    function testHighlight() {
-      highlights[4][2] = "cfb700";
-      highlights[3][1] = "cfb700";
-      highlights[2][0] = "cfb700";
-      highlights[1][0] = "cfb700";
-      highlights[0][0] = "cfb700";
-
-      highlights[5][3] = "cfb700";
-      highlights[6][4] = "cfb700";
-      highlights[7][5] = "cfb700";
-      highlights[8][5] = "cfb700";
-    }
-
-    function clearTable() {
-      for (let r = 0; r < rows; r++)
-        for (let c = 0; c < cols; c++)
-          table[r][c] = "";
-    }
-
-    function clearSVG() {
-      const svg = document.getElementById("svgOverlay");
-      if (svg) svg.innerHTML = "";
-    }
-
-    function clearAll() {
-      clearTable();
-      highlights = highlights.map(row => row.map(() => ""));
-      frames = [];
-      sumPulse = sumPulse.map(row => row.map(() => false));
-      clearSVG();
-      
-    }
-
-    function togglePlay(){
-      if (playing) {
-        playing = false;
-      } else {
-        playing = true;
-        play();
-      }
-    }
-
-    async function play() {
-      playing = true;
-      while (playing && currentFrame < frames.length) {
-        const f = frames[currentFrame];
-        applyFrame(currentFrame);
-        currentFrame++;
-        
-        const extraDelay = 
-        f.type === "highlight" ? 250 : 
-        f.type === "updateBounds" ? -speed :
-        0;
-
-        await tick();
-        await new Promise(res => setTimeout(res, speed + extraDelay));
-      }
-      // at the end generate path
-      if(currentFrame >= frames.length && frames.length !==0){
-        generateAlignmentSVG();
-      }
-    }
-
-    function pause() {
+    if (run === playRun && atEnd()) {
       playing = false;
+      drawPath();
     }
+  }
 
-    function stepForward() {
-      if (currentFrame >= frames.length - 1) return;
-
-      if (currentFrame < frames.length) {
-        applyFrame(currentFrame);
-        currentFrame++;
-        while(frames[currentFrame].type === "updateBounds"){
-          currentFrame++;
-        }
-      }
+  // updateBounds frames change nothing on screen, so one click steps past them
+  // instead of appearing to do nothing.
+  function stepForward() {
+    playing = false;
+    while (currentFrame < frames.length) {
+      const frame = frames[currentFrame];
+      showFrame(currentFrame++);
+      if (frame.type !== "updateBounds") break;
     }
+    if (atEnd()) drawPath();
+  }
 
-    function stepBackward() {
-      if (currentFrame > 0) {
-        currentFrame--;
-        while(frames[currentFrame].type === "updateBounds"){
-          currentFrame--;
-        }
-        clearAll();
-        for (let i = 0 ; i < currentFrame; i++)
-          applyFrame(i);
-      }
-    }
+  // A frame can't be undone, so stepping back replays from the start up to the
+  // previous position.
+  function stepBackward() {
+    playing = false;
+    if (currentFrame <= 0) return;
 
-    // rowOffset represents the row we are starting at, colOffset represents the column we are starting at. the end of the region can be derived from the length of seqA and seqB.
-    // so for true index of array 
-    // r: rowOffset + i;
-    // c: colOffset + j;
-    function hirschbergForward(A, B, rowOffset, colOffset) {
-      // A = sequenceA, B = sequenceB
-      const n = A.length;
-      const m = B.length;
+    let target = currentFrame - 1;
+    while (target > 0 && frames[target - 1].type === "updateBounds") target--;
 
-      // Only two rows needed; O(m) space
-      let prev = Array(m + 1).fill(0);
-      let curr = Array(m + 1).fill(0);
+    resetBoard({ withCorners: true });
+    currentFrame = target;
+    for (let i = 0; i < currentFrame; i++) showFrame(i, false);
+  }
 
-      // Initialize first row
-      for (let j = 0; j <= m; j++) {
-        prev[j] = j;
-        frames.push({
-            type: "setCell",
-            r: rowOffset,
-            c: colOffset + j,
-            value: prev[j]
-        });
-      }
+  // ---------------------------------------------------------------------------
+  // The finished path, drawn as a line through the centers of the gold cells
+  // ---------------------------------------------------------------------------
 
-      // process the rest of the rows
-      for (let i = 1; i <= n ; i++) {
-        // first column of each row will always just be the row #
-        curr[0] = i;
-        frames.push({
-            type: "setCell",
-            r: rowOffset + i,
-            c: colOffset,
-            value: curr[0]
-        });
+  let wrapperEl;
+  let tableEl;
+  let pathPoints = "";
 
-        // the rest of the columns are resolved just like needlemanwunsch
-        for (let j = 1; j <= m; j++) {
-          const cost = (A[i - 1] === B[j - 1] ? 0 : 1);
+  function drawPath() {
+    const origin = wrapperEl.getBoundingClientRect();
+    const centers = pathCells(board.highlights).map(([r, c]) => {
+      // +1 skips the row's letter header.
+      const cell = tableEl.tBodies[0].rows[r].cells[c + 1].getBoundingClientRect();
+      return `${cell.left + cell.width / 2 - origin.left},${cell.top + cell.height / 2 - origin.top}`;
+    });
+    pathPoints = centers.length >= 2 ? centers.join(" ") : "";
+  }
+</script>
 
-          curr[j] = Math.min(
-            prev[j] + 1,        // delete ↓
-            curr[j - 1] + 1,    // insert →
-            prev[j - 1] + cost  // match/mismatch ↘
-          );
+<h1>Hirschberg Algorithm Explainer</h1>
 
-          frames.push({
-            type: "setCell",
-            r: rowOffset + i,
-            c: colOffset + j,
-            value: curr[j]
-          });
+<div class="main-container">
+  <div class="input-block">
+    <label for="seqA">DNA Sequence A</label>
+    <textarea id="seqA" bind:value={seqA} on:input={explainRejectedInput} style="--chars: {boxWidthInChars(seqA)}"
+      placeholder="ACGTACGT" spellcheck="false" autocomplete="off"></textarea>
+    <span class="count">{seqA.length}/{MAX_LEN}</span>
+  </div>
 
-        }
-        
-        // swap rows
-        [prev, curr] = [curr, prev] // funfact: you cant just do prev = curr because variables are assigned by reference with equality operator in js
-      }
+  <div class="input-block">
+    <label for="seqB">DNA Sequence B</label>
+    <textarea id="seqB" bind:value={seqB} on:input={explainRejectedInput} style="--chars: {boxWidthInChars(seqB)}"
+      placeholder="AGTACG" spellcheck="false" autocomplete="off"></textarea>
+    <span class="count">{seqB.length}/{MAX_LEN}</span>
+  </div>
 
-      return prev;
-    }
+  <p class="input-notice" role="status">{inputNotice}</p>
 
-    // rowOffset represents the row we are starting at, colOffset represents the column we are starting at. the end of the region can be derived from the length of seqA and seqB.
-    // so for true index of array 
-    // r: rowOffset + i;
-    // c: colOffset + j;
-    // as of now dont pass in A and B in their reversed form, the for loops account for that
-    function hirschbergBackward(A, B, rowOffset, colOffset) {
-      // A = sequenceA, B = sequenceB
-      const n = A.length;
-      const m = B.length;
+  <button on:click={align}>Align</button>
 
-      // Only two rows needed; O(m) space
-      let prev = Array(m + 1).fill(0);
-      let curr = Array(m + 1).fill(0);
+  <div class="dp-wrapper" bind:this={wrapperEl}>
+    <table class="dp-table" id="dpTable" bind:this={tableEl}>
+      <thead>
+        <tr>
+          <td></td>
+          <td class="seq-header">—</td>
+          {#each seqB as base}
+            <td class="seq-header">{base}</td>
+          {/each}
+        </tr>
+      </thead>
+      <tbody>
+        {#each Array(rows) as _, r}
+          <tr>
+            <td class="seq-header">{r === 0 ? "—" : seqA[r - 1]}</td>
+            {#each Array(cols) as _, c}
+              <td class:on-path={board.highlights[r][c]} class:sum-pulse={pulsing[r][c]}>
+                {board.table[r][c]}
+              </td>
+            {/each}
+          </tr>
+        {/each}
+      </tbody>
+    </table>
 
-      // Initialize first row (going from right to left, bottom to top)
-      for (let j = m; j > -1; j--) {
-        prev[j] = m - j;
-        frames.push({
-            type: "setCell",
-            r: rowOffset + n,   // start on last row (remember theres a `-` so dont need -1)
-            c: colOffset + j,   // start on last col (remember theres a '-' so dont need -1)
-            value: prev[j]
-        });
-      }
-
-      // process the rest of the rows
-      for (let i = n - 1; i > -1; i--) {
-        // last column of each row will always be equal to n - i; which is lastrow# - row# we are on
-        curr[m] = n - i;
-        if (i != 0){
-          frames.push({
-            type: "setCell",
-            r: rowOffset + i,
-            c: colOffset + m,
-            value: curr[m]
-          });
-        } else {
-          frames.push({
-            type: "sumCell",
-            r: rowOffset + i,
-            c: colOffset + m,
-            value: curr[m]
-          });
-        }
-
-        // the rest of the columns are resolved just like needlemanwunsch
-        for (let j = m - 1; j > -1; j--){
-          const cost = A[i] === B[j] ? 0 : 1;
-          curr[j] = Math.min(
-            prev[j] + 1,          // delete ↑
-            curr[j + 1] + 1,      // insert ←
-            prev[j + 1] + cost,   // match/mismatch ↖
-          );
-
-          if (i != 0){
-            frames.push({
-              type: "setCell",
-              r: rowOffset + i,
-              c: colOffset + j,
-              value: curr[j]
-            });
-          } else {
-            frames.push({
-              type: "sumCell",
-              r: rowOffset + i,
-              c: colOffset + j,
-              value: curr[j]
-            })
-          }
-          
-        }
-
-        [prev, curr] = [curr, prev];
-      }
-
-      return prev;
-    }
-
-    function emitSplitHighlight(forward, backward, rowOffset, colOffset){
-      let bestIdx = 0;
-      let best = Infinity;
-
-      console.log("Trying highlight, computing scores between ", forward, backward);
-
-      for (let j = 0; j < forward.length; j++) {
-        const s = forward[j] + backward[j];
-        if (s < best) {
-          best = s;
-          bestIdx = j;
-        }
-      }
-
-      frames.push({
-        type: "highlight",
-        r: rowOffset,
-        c: colOffset + bestIdx
-      });
-
-      // everytime we find a highlight, we want to clear table for the new subproblem
-      frames.push({
-        type: "clearTable"
-      })
-
-      console.log("minIdx is at", bestIdx);
-
-      return bestIdx;
-    }
-
-    function hirschbergBaseCase(A, B, rowOffset, colOffset){
-      const n = A.length;
-      const m = B.length;
-
-       // Build small DP table (just numbers)
-      let dp = Array.from({ length: n + 1 }, () =>
-          Array.from({ length: m + 1 }, () => 0)
-      );
-
-      // init first col/row
-      for (let i = 0; i <= n; i++) dp[i][0] = i;
-      for (let j = 0; j <= m; j++) dp[0][j] = j;
-      
-      // fill remaining cells
-      for (let i = 1; i <= n; i++){
-        for (let j = 1; j<= m; j++){
-          const cost = A[i - 1] === B[j - 1] ? 0 : 1;
-
-          dp[i][j] = Math.min(
-            dp[i-1][j] + 1,
-            dp[i][j - 1] + 1,
-            dp[i - 1][j - 1] + cost
-          );
-
-          frames.push({
-            type: "setCell",
-            r: rowOffset + i,
-            c: colOffset + j,
-            value: dp[i][j]
-          });
-
-        }
-      }
-
-      // TRACEBACK
-      let i = n;
-      let j = m;
-      while (i > 0 || j > 0) {
-    
-        frames.push({
-            type: "highlight",
-            r: rowOffset + i,
-            c: colOffset + j
-        });
-
-        // everytime we find a highlight, we want to clear table for the new subproblem
-        frames.push({
-          type: "clearTable"
-        })
-
-        if (i > 0 && j > 0) {
-            const cost = A[i - 1] === B[j - 1] ? 0 : 1;
-            if (dp[i][j] === dp[i - 1][j - 1] + cost) {
-                i--; j--; continue;
-            }
-        }
-
-        if (i > 0 && dp[i][j] === dp[i - 1][j] + 1) {
-            i--; continue;
-        }
-
-        if (j > 0 && dp[i][j] === dp[i][j - 1] + 1) {
-            j--; continue;
-        }
-      }
-
-      // frames.push({
-      //     type: "highlight",
-      //     r: rowOffset,
-      //     c: colOffset
-      // });
-
-
-    }
-
-    function hirschberg(A, B, rowOffset = 0, colOffset = 0){
-      const n = A.length;
-      const m = B.length;
-      frames.push({
-        type: "updateBounds",
-        r: n+1,
-        c: m+1,
-        rowOffset: rowOffset,
-        colOffset: colOffset
-      })
-
-      if (n === 0) return;
-      if ( n === 1 && m === 1) return;
-      if (n === 1 || m === 1){
-        // Base case:
-        hirschbergBaseCase(A, B, rowOffset, colOffset);
-        console.log("basecase: ", A, B, "offsets", rowOffset, colOffset);
-        return;
-      }
-
-      const mid = Math.floor(n / 2);
-      //console.log("forward call:", A.slice(0, mid), B);
-      //console.log("backwards call", A.slice(mid), B);
-
-
-      const forward = hirschbergForward(A.slice(0, mid), B, rowOffset, colOffset);
-      const backward = hirschbergBackward(A.slice(mid), B, rowOffset + mid, colOffset);
-
-      const splitCol = emitSplitHighlight(forward, backward, rowOffset + mid, colOffset);
-
-      // recurse on both halves
-      hirschberg(A.slice(0, mid), B.slice(0, splitCol), rowOffset, colOffset);
-      hirschberg(A.slice(mid), B.slice(splitCol), rowOffset + mid, colOffset + splitCol);
-      
-    }
-
-    function testforward(){
-      hirschbergForward("AGTA", seqB, 0, 0);
-    }
-
-    function testbackward(){
-
-      hirschbergBackward("CGCA", seqB, 4, 0);
-    }
-
-    function getHighlightedCells() {
-      const coords = [];
-      coords.push([0,0]);
-
-      for (let i = 0; i < rows; i++) {
-        for (let j = 0; j < cols; j++) {
-          if (highlights[i][j] === "cfb700") {
-            coords.push([i, j]);
-          }
-        }
-      }
-      coords.push([rows-1, cols-1]);
-      console.log("highlighted cells:", coords)
-      
-      return coords;
-    }
-
-
-    function convertToPixels(cells, cellSize) {
-      if (!tableEl) return [];
-      const tableRect = tableEl.getBoundingClientRect();
-      const wrapperRect = tableEl.closest('.dpWrapper').getBoundingClientRect();
-      
-      return cells.map(([i, j]) => {
-        // Find the actual cell element
-        const cellEl = tableEl.querySelector(`tbody tr:nth-child(${i + 1}) td:nth-child(${j + 2})`);
-        if (!cellEl) return { x: 0, y: 0 };
-        
-        const cellRect = cellEl.getBoundingClientRect();
-        
-        // Get center of cell relative to wrapper
-        return {
-          x: cellRect.left + cellRect.width / 2 - wrapperRect.left,
-          y: cellRect.top + cellRect.height / 2 - wrapperRect.top
-        };
-      });
-    }
-
-
-    function generateAlignmentSVG(cellSize = 35) {
-      const rawCells = getHighlightedCells();
-      const points = convertToPixels(rawCells, 35);
-      console.log("coordiantes of cells:", points);
-      
-      // Set SVG to match wrapper size
-      if (tableEl) {
-        const wrapper = tableEl.closest('.dpWrapper');
-        const rect = wrapper.getBoundingClientRect();
-        svgEl.setAttribute("width", rect.width);
-        svgEl.setAttribute("height", rect.height);
-      }
-      
-      drawPathOnGrid(points);
-    }
-
-
-    function drawPathOnGrid(points) {
-      if (!svgEl || !tableRect) return;
-
-      const pts = points
-      .map(p => `${p.x},${p.y}`)
-      .join(" ");
-
-      console.log("points", pts);
-
-      svgEl.innerHTML = `
+    <svg id="svgOverlay">
+      {#if pathPoints}
         <polyline
-          points="${pts}"
+          points={pathPoints}
           fill="none"
           stroke="white"
           stroke-width="3"
           stroke-linecap="round"
           stroke-linejoin="round"
         />
-      `;
+      {/if}
+    </svg>
+  </div>
 
-      togglePlay();
-    }
+  <div class="bottom-buttons">
+    <button on:click={stepBackward}>⏮ </button>
+    <button on:click={togglePlay}>{playing ? "⏸" : "▶"}</button>
+    <button on:click={stepForward}>⏭ </button>
+    <button on:click={clearAll}>Clear</button>
+  </div>
 
-    function dedupeHighlights(frames) {
-      const seen = new Set();
-      const result = [];
-
-      
-
-      for (const f of frames) {
-        if (f.type === "highlight") {
-          const key = `${f.r},${f.c}`;
-          if (seen.has(key) || (f.r === 0 && f.c === 0) || (f.r === rows - 1 && f.c === cols - 1)) {
-            continue;
-          }
-          seen.add(key);
-        }
-        result.push(f)
-      }
-
-      return result;
-
-      
-    }
-
-    function cellHighlight(r, c) {
-      // Always highlight top-left and bottom-right
-      if ((r === 0 && c === 0) || (r === rows - 1 && c === cols - 1)) {
-        return "#cfb700"; 
-      }
-
-      return highlights[r][c]; // fall back to actual animation highlight
-    }
-
-
-
-</script>
+  <Article />
+</div>
 
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Architects+Daughter&display=swap');
-    :global(body) {
+  @import url("https://fonts.googleapis.com/css2?family=Architects+Daughter&display=swap");
+
+  :global(body) {
     font-family: "Architects Daughter", cursive;
   }
-  .main-container{
+
+  h1 {
+    text-align: center;
+    text-decoration: underline;
+    font-size: 64px;
+    margin: 30px 0 40px 0;
+    letter-spacing: 2px;
+  }
+
+  .main-container {
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 20px;
     padding: 20px;
   }
-  .dpWrapper{
-    position: relative;
-    display: inline-block;
-  }
-  .dp-table {
-    position: relative;
-    z-index: 1;
-  }
-  #svgOverlay {
-    position: absolute;
-    top: 0;
-    left: 0;
-    z-index: 10; /*  above the table */
-    pointer-events: none;
-  }
-  table {
-    border-collapse: collapse;
-    font-size: 18px;
-    margin-top: 20px;
-  }
-  td {
-    border: 2px solid #333;
-    width: 35px;
-    height: 35px;
-    text-align: center;
-    vertical-align: middle;
-  
-  }
-  thead td {
-    font-weight: bold;
-    color:black;
-    background: #fafafac6;
-  }
-  .left-header {
-    font-weight: bold;
-    color:black;
-    background: #fafafac6;
-  }
-  .input-block{
-    margin-bottom: 12px;
+
+  /* Inputs */
+
+  .input-block {
     display: flex;
-    flex-direction: row;
     align-items: center;
     gap: 10px;
     margin-bottom: 12px;
-    font: "Architects Daughter";
+    /* Fixed width with the label pinned left, so a growing box extends to the
+       right instead of re-centering the whole row on every keystroke. */
+    width: 420px;
   }
   .input-block label {
     font-weight: 600;
@@ -724,19 +301,22 @@
     min-width: 120px;
   }
   .input-block textarea {
-    flex: 1;
+    /* One character is 1ch plus the 2px letter-spacing. */
+    width: calc(var(--chars) * (1ch + 2px));
+    height: 15px;
     padding: 3px 6px;
+    white-space: pre;
+    overflow: hidden;
+    resize: none;
+    font-family: "Courier New", monospace;
     font-size: 14px;
-    font-family: 'Courier New', monospace;
     font-weight: 100;
-    letter-spacing: 2px; /* Space out DNA letters */
-    text-transform: uppercase; /* Force uppercase */
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: #4ec9b0;
+    background-color: #1e1e1e;
     border: 2px solid #3a3a3a;
     border-radius: 12px;
-    background-color: #1e1e1e;
-    color: #4ec9b0; /* Teal/cyan color - DNA themed */
-    resize: none; /* Prevent resizing */
-    height: 15px;
     transition: all 0.3s ease;
   }
   .input-block textarea:hover {
@@ -748,116 +328,93 @@
     background-color: #252525;
     box-shadow: 0 0 20px rgba(78, 201, 176, 0.15);
   }
-  .top-buttons{
-    display: flex;
-    gap: 10px;
+  .count {
+    font-size: 12px;
+    color: #888;
   }
-  h1{
-    text-align: center;
-    text-decoration: underline;
-    font-size: 64px;
-    margin: 30px 0 40px 0;
-    letter-spacing: 2px;
-    
+  .input-notice {
+    min-height: 1.4em; /* keeps the layout still when the message clears */
+    margin: 0;
+    font-size: 14px;
+    color: #e5a04b;
   }
-  .header-container {
-    text-align: center;
 
+  /* The DP table and the path drawn over it */
+
+  .dp-wrapper {
+    position: relative;
+    display: inline-block;
   }
-  .highlight-pulse {
+  .dp-table {
+    position: relative;
+    z-index: 1;
+    border-collapse: collapse;
+    font-size: 18px;
+    margin-top: 20px;
+  }
+  #svgOverlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 10;
+    pointer-events: none;
+  }
+  td {
+    border: 2px solid #333;
+    width: 35px;
+    height: 35px;
+    text-align: center;
+    vertical-align: middle;
+  }
+  thead td,
+  .seq-header {
+    font-weight: bold;
+    color: black;
+    background: #fafafac6;
+  }
+
+  .on-path {
+    background-color: #cfb700;
     animation: pulse 0.2s ease-out forwards;
   }
   @keyframes pulse {
     0%   { background-color: #cfb700; transform: scale(1); }
-    50%  { background-color: rgba(255, 217, 0, 0.805)500;   transform: scale(1.12); }
+    50%  { background-color: rgba(255, 217, 0, 0.805); transform: scale(1.12); }
     100% { background-color: #cfb700; transform: scale(1); }
   }
 
+  /* Declared after .on-path so it wins on a cell that is both. */
   .sum-pulse {
-  animation: sumPulse 0.1s ease-out;
+    animation: sumPulse 0.1s ease-out;
   }
-
   @keyframes sumPulse {
-    0%   { transform: scale(1);   background-color: inherit;  opacity: 1; }
+    0%   { transform: scale(1);    background-color: inherit; opacity: 1; }
     50%  { transform: scale(1.15); background-color: inherit; opacity: 0.9; }
-    100% { transform: scale(1);   background-color: inherit;  opacity: 1; }
+    100% { transform: scale(1);    background-color: inherit; opacity: 1; }
   }
-  
+
+  @media (prefers-color-scheme: light) {
+    .input-block label {
+      color: #333;
+    }
+    .input-block textarea {
+      color: #146356;
+      font-weight: 600;
+      background-color: #ececec;
+      border-color: #cfcfcf;
+    }
+    .input-block textarea:hover {
+      border-color: #b5b5b5;
+    }
+    .input-block textarea:focus {
+      background-color: #f4f4f4;
+      border-color: #2a9d86;
+      box-shadow: 0 0 20px rgba(42, 157, 134, 0.15);
+    }
+    .input-notice {
+      color: #a35c00;
+    }
+  }
 </style>
-
-<div class="header-container">
-  <h1>Hirschberg Algorithm Explainer</h1>
-</div>
-
-<div class="main-container">
-
-<div class="input-block">
-  <label for="seqA">DNA Sequence A</label>
-  <textarea id="seqA" bind:value={seqA} placeholder="ACGTACGT" spellcheck="false" autocomplete="off"></textarea>
-</div>
-
-<div class="input-block">
-
-  <label for="seqB">DNA Sequence B</label>
-  <textarea id="seqB" bind:value={seqB} placeholder="AGTACG" spellcheck="false" autocomplete="off"></textarea>    
-</div>
-
-<div class="top-buttons">
-  <button on:click={generateFrames}>Align</button>
-</div>
-<!-- <button on:click={testforward}>genforwardpass</button> -->
-<!-- <button on:click={testbackward}>genbackwardpass</button> -->
-
-<!-- <button on:click={generateAlignmentSVG}>testSVG </button> -->
-<!-- <button on:click={testHighlight}>highlightCells </button> -->
-
-
-
-<!-- Top header row -->
- <div class="dpWrapper">
-   <table class="dp-table" id="dpTable" bind:this={tableEl}>
-     <thead>
-       <tr>
-         <td></td> <!-- corner blank -->
-         <td class="left-header">—</td>
-         {#each seqB as ch}
-         <td class="left-header">{ch}</td>
-         {/each}
-        </tr>
-      </thead>
-      
-      <!-- Body with left header column -->
-      <tbody>
-        {#each Array(rows) as _, r}
-        <tr>
-          <td class="left-header">
-            {r === 0 ? "—" : seqA[r-1]}
-          </td>
-          
-          {#each Array(cols) as _, c}
-          <td style="background: {highlights[r][c]}" class:highlight-pulse={highlights[r][c] === "cfb700"} class:sum-pulse={sumPulse[r][c]}>
-            {table[r][c]}
-          </td>
-          {/each}
-        </tr>
-        {/each}
-      </tbody>
-    </table>
-    <svg id="svgOverlay" bind:this={svgEl}></svg>
-  </div>
-
-
-<div class="bottom-buttons">
-  <button on:click={stepBackward}>⏮ </button>
-  <button on:click={togglePlay}>
-    {playing ?  "⏸" :  "▶"}
-  </button>
-  <button on:click={stepForward}>⏭ </button>
-  <button on:click={clearAll}>Clear</button>
-</div>
-
-<Article>
-
-</Article>
-
-</div>
